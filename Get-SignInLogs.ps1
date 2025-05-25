@@ -1,40 +1,25 @@
 # ========== Configuration ==========
-$InputFile = "ObjectId.txt"
+$InputFile = "ObjectId.txt"  # Ensure this is in the same directory or update the path
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$OutputFile = "SignInoutput_$Timestamp.csv"
+$OutputFile = "SignInOutput_$Timestamp.csv"
 
-# Environment Variables (set in Azure DevOps pipeline)
+# Read environment variables (set via Azure DevOps)
 $TenantId = $env:TenantId
 $ClientId = $env:ClientId
 $ClientSecret = $env:ClientSecret
 
-# Microsoft Graph scope
-$scope = "https://graph.microsoft.com/.default"
-# ===================================
-
-# ========== Authentication ==========
-# Request access token using client credentials
-$tokenBody = @{
-    client_id     = $ClientId
-    scope         = $scope
-    client_secret = $ClientSecret
-    grant_type    = "client_credentials"
+# Required modules
+if (-not (Get-Module -ListAvailable -Name "Microsoft.Graph")) {
+    Install-Module Microsoft.Graph -Scope CurrentUser -Force
 }
-try {
-    $tokenResponse = Invoke-RestMethod -Method Post `
-        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-        -Body $tokenBody -ErrorAction Stop
-    $accessToken = $tokenResponse.access_token
-} catch {
-    Write-Error "❌ Failed to retrieve access token. $_"
-    exit 1
-}
+Import-Module Microsoft.Graph
 
-# Connect to Microsoft Graph with access token
-Connect-MgGraph -AccessToken $accessToken
-# =============================================
+# Authenticate using Azure.Identity.ClientSecretCredential
+Add-Type -Path "$env:HOME/.local/share/powershell/Modules/Azure.Identity/*/lib/netstandard2.0/Azure.Identity.dll"
+$credential = [Azure.Identity.ClientSecretCredential]::new($TenantId, $ClientId, $ClientSecret)
+Connect-MgGraph -ClientSecretCredential $credential -Scopes "https://graph.microsoft.com/.default"
 
-# ========== Input Validation ==========
+# ===== Read Input IDs =====
 if (-Not (Test-Path $InputFile)) {
     Write-Error "❌ Input file not found: $InputFile"
     Disconnect-MgGraph
@@ -46,23 +31,12 @@ if (-not $userIds) {
     Disconnect-MgGraph
     exit 1
 }
-# ======================================
 
-# Prepare output CSV file with headers
-[PSCustomObject]@{
-    UserId      = ''
-    DisplayName = ''
-    SignInTime  = ''
-    IP          = ''
-    ClientApp   = ''
-    Status      = ''
-} | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
-
-# Initial Graph API URL (last 30 days filter)
+# ===== Fetch Sign-In Logs =====
 $startDate = (Get-Date).AddDays(-30).ToString("yyyy-MM-dd")
+$logs = @()
 $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=createdDateTime ge $startDate"
 
-# Process logs page by page
 do {
     try {
         $response = Invoke-MgGraphRequest -Uri $uri -Method GET
@@ -71,32 +45,40 @@ do {
         Disconnect-MgGraph
         exit 1
     }
-
-    # Filter logs for specific user Object IDs
-    $filtered = $response.value | Where-Object { $userIds -contains $_.userId }
-
-    # Format filtered logs for output
-    $entries = $filtered | ForEach-Object {
-        [PSCustomObject]@{
-            UserId      = $_.userId
-            DisplayName = $_.userDisplayName
-            SignInTime  = $_.createdDateTime
-            IP          = $_.ipAddress
-            ClientApp   = $_.clientAppUsed
-            Status      = $_.status.errorCode
-        }
-    }
-
-    # Append entries to output file
-    if ($entries.Count -gt 0) {
-        $entries | Export-Csv -Path $OutputFile -Append -NoTypeInformation -Encoding UTF8
-        Write-Host "✅ Processed and saved $($entries.Count) log(s)..."
-    }
-
+    $logs += $response.value
     $uri = $response.'@odata.nextLink'
 } while ($uri)
 
-Write-Host "`n✅ Finished exporting filtered sign-in logs to: $OutputFile" -ForegroundColor Green
+if (-not $logs) {
+    Write-Host "❌ No sign-in logs returned from Microsoft Graph." -ForegroundColor Red
+    Disconnect-MgGraph
+    exit 1
+}
 
-# Disconnect from Microsoft Graph
+# ===== Filter logs and export =====
+$filteredLogs = $logs | Where-Object { $userIds -contains $_.userId }
+
+$latestLogs = $filteredLogs |
+    Sort-Object createdDateTime -Descending |
+    Group-Object userId |
+    ForEach-Object { $_.Group | Select-Object -First 1 }
+
+$final = $latestLogs | ForEach-Object {
+    [PSCustomObject]@{
+        UserId      = $_.userId
+        DisplayName = $_.userDisplayName
+        SignInTime  = $_.createdDateTime
+        IP          = $_.ipAddress
+        ClientApp   = $_.clientAppUsed
+        Status      = $_.status.errorCode
+    }
+}
+
+if ($final.Count -gt 0) {
+    $final | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "`n✅ Exported latest sign-ins to: $OutputFile" -ForegroundColor Green
+} else {
+    Write-Host "`n⚠️ No sign-in logs found for the provided Object IDs." -ForegroundColor Yellow
+}
+
 Disconnect-MgGraph
