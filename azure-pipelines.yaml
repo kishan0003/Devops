@@ -19,7 +19,7 @@ jobs:
     displayName: "Install PowerShell Core (if needed)"
     inputs:
       packageType: 'sdk'
-      version: '7.x.x'
+      version: '7.4.x'
       installationPath: $(Agent.ToolsDirectory)/dotnet
 
   - script: |
