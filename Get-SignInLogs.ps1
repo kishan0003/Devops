@@ -1,28 +1,26 @@
 # ========== Configuration ==========
-$InputFile = "ObjectId.txt"  # Make sure this file is in the same directory or update path
+$InputFile = "ObjectId.txt"
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $OutputFile = "SignInoutput_$Timestamp.csv"
 
-# Read from environment variables (passed from Azure DevOps pipeline)
+# Environment Variables from Azure DevOps
 $TenantId = $env:TenantId
 $ClientId = $env:ClientId
 $ClientSecret = $env:ClientSecret
-
-# Microsoft Graph permission scope
 $Scopes = @("https://graph.microsoft.com/.default")
 # ===================================
 
-# Install Microsoft.Graph if not already present
+# Install & import Microsoft.Graph if not present
 if (-not (Get-Module -ListAvailable -Name "Microsoft.Graph")) {
     Install-Module Microsoft.Graph -Scope CurrentUser -Force
 }
 Import-Module Microsoft.Graph
 
-# Authenticate using client credentials (non-interactive)
+# Authenticate using client credentials
 $secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
 Connect-MgGraph -ClientId $ClientId -TenantId $TenantId -ClientSecret $secureSecret
 
-# Read and validate Object IDs from input file
+# Validate input file
 if (-Not (Test-Path $InputFile)) {
     Write-Error "❌ Input file not found: $InputFile"
     Disconnect-MgGraph
@@ -35,10 +33,21 @@ if (-not $userIds) {
     exit 1
 }
 
-# Fetch all sign-in logs with pagination
-$logs = @()
-$uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns"
+# Sign-ins API URI (optional filter by date)
+$startDate = (Get-Date).AddDays(-30).ToString("yyyy-MM-dd")
+$uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=createdDateTime ge $startDate"
 
+# Initialize CSV with headers
+[PSCustomObject]@{
+    UserId      = ''
+    DisplayName = ''
+    SignInTime  = ''
+    IP          = ''
+    ClientApp   = ''
+    Status      = ''
+} | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+
+# Stream and filter logs page by page
 do {
     try {
         $response = Invoke-MgGraphRequest -Uri $uri -Method GET
@@ -47,44 +56,29 @@ do {
         Disconnect-MgGraph
         exit 1
     }
-    $logs += $response.value
+
+    $filtered = $response.value | Where-Object { $userIds -contains $_.userId }
+
+    $entries = $filtered | ForEach-Object {
+        [PSCustomObject]@{
+            UserId      = $_.userId
+            DisplayName = $_.userDisplayName
+            SignInTime  = $_.createdDateTime
+            IP          = $_.ipAddress
+            ClientApp   = $_.clientAppUsed
+            Status      = $_.status.errorCode
+        }
+    }
+
+    if ($entries.Count -gt 0) {
+        $entries | Export-Csv -Path $OutputFile -Append -NoTypeInformation -Encoding UTF8
+        Write-Host "✅ Processed and saved $($entries.Count) log(s)..."
+    }
+
     $uri = $response.'@odata.nextLink'
 } while ($uri)
 
-if (-not $logs) {
-    Write-Host "❌ No sign-in logs returned from Microsoft Graph." -ForegroundColor Red
-    Disconnect-MgGraph
-    exit 1
-}
+Write-Host "`n✅ Finished exporting filtered sign-in logs to: $OutputFile" -ForegroundColor Green
 
-# Filter logs for user IDs present in input list
-$filteredLogs = $logs | Where-Object { $userIds -contains $_.userId }
-
-# Get latest log per user
-$latestLogs = $filteredLogs |
-    Sort-Object createdDateTime -Descending |
-    Group-Object userId |
-    ForEach-Object { $_.Group | Select-Object -First 1 }
-
-# Prepare final output
-$final = $latestLogs | ForEach-Object {
-    [PSCustomObject]@{
-        UserId       = $_.userId
-        DisplayName  = $_.userDisplayName
-        SignInTime   = $_.createdDateTime
-        IP           = $_.ipAddress
-        ClientApp    = $_.clientAppUsed
-        Status       = $_.status.errorCode
-    }
-}
-
-# Export to CSV if results exist
-if ($final.Count -gt 0) {
-    $final | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
-    Write-Host "`n✅ Exported latest sign-ins to: $OutputFile" -ForegroundColor Green
-} else {
-    Write-Host "`n⚠️ No sign-in logs found for the provided Object IDs." -ForegroundColor Yellow
-}
-
-# Disconnect session
+# Cleanup
 Disconnect-MgGraph
