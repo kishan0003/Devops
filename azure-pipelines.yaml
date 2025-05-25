@@ -1,0 +1,35 @@
+trigger:
+  branches:
+    include:
+      - main  # Adjust as needed
+
+pool:
+  name: Default  # Replace with your self-hosted Linux agent pool name
+
+variables:
+  TenantId: $(TenantId)
+  ClientId: $(ClientId)
+  ClientSecret: $(ClientSecret)
+
+jobs:
+- job: FetchSignInLogs
+  displayName: "Fetch latest sign-in logs from Microsoft Graph"
+  steps:
+  - task: UseDotNet@2
+    displayName: "Install PowerShell Core (if needed)"
+    inputs:
+      packageType: 'sdk'
+      version: '7.x.x'
+      installationPath: $(Agent.ToolsDirectory)/dotnet
+
+  - script: |
+      pwsh --version
+    displayName: "Verify PowerShell Core is installed"
+
+  - script: |
+      pwsh ./Get-SignInLogs.ps1
+    displayName: "Run Sign-In Log Script"
+    env:
+      TenantId: $(TenantId)
+      ClientId: $(ClientId)
+      ClientSecret: $(ClientSecret)
