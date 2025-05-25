@@ -3,24 +3,38 @@ $InputFile = "ObjectId.txt"
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $OutputFile = "SignInoutput_$Timestamp.csv"
 
-# Environment Variables from Azure DevOps
+# Environment Variables (set in Azure DevOps pipeline)
 $TenantId = $env:TenantId
 $ClientId = $env:ClientId
 $ClientSecret = $env:ClientSecret
-$Scopes = @("https://graph.microsoft.com/.default")
+
+# Microsoft Graph scope
+$scope = "https://graph.microsoft.com/.default"
 # ===================================
 
-# Install & import Microsoft.Graph if not present
-if (-not (Get-Module -ListAvailable -Name "Microsoft.Graph")) {
-    Install-Module Microsoft.Graph -Scope CurrentUser -Force
+# ========== Authentication ==========
+# Request access token using client credentials
+$tokenBody = @{
+    client_id     = $ClientId
+    scope         = $scope
+    client_secret = $ClientSecret
+    grant_type    = "client_credentials"
 }
-Import-Module Microsoft.Graph
+try {
+    $tokenResponse = Invoke-RestMethod -Method Post `
+        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+        -Body $tokenBody -ErrorAction Stop
+    $accessToken = $tokenResponse.access_token
+} catch {
+    Write-Error "❌ Failed to retrieve access token. $_"
+    exit 1
+}
 
-# Authenticate using client credentials
-$secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
-Connect-MgGraph -ClientId $ClientId -TenantId $TenantId -ClientSecret $secureSecret
+# Connect to Microsoft Graph with access token
+Connect-MgGraph -AccessToken $accessToken
+# =============================================
 
-# Validate input file
+# ========== Input Validation ==========
 if (-Not (Test-Path $InputFile)) {
     Write-Error "❌ Input file not found: $InputFile"
     Disconnect-MgGraph
@@ -32,12 +46,9 @@ if (-not $userIds) {
     Disconnect-MgGraph
     exit 1
 }
+# ======================================
 
-# Sign-ins API URI (optional filter by date)
-$startDate = (Get-Date).AddDays(-30).ToString("yyyy-MM-dd")
-$uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=createdDateTime ge $startDate"
-
-# Initialize CSV with headers
+# Prepare output CSV file with headers
 [PSCustomObject]@{
     UserId      = ''
     DisplayName = ''
@@ -47,7 +58,11 @@ $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=createdDateT
     Status      = ''
 } | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
 
-# Stream and filter logs page by page
+# Initial Graph API URL (last 30 days filter)
+$startDate = (Get-Date).AddDays(-30).ToString("yyyy-MM-dd")
+$uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=createdDateTime ge $startDate"
+
+# Process logs page by page
 do {
     try {
         $response = Invoke-MgGraphRequest -Uri $uri -Method GET
@@ -57,8 +72,10 @@ do {
         exit 1
     }
 
+    # Filter logs for specific user Object IDs
     $filtered = $response.value | Where-Object { $userIds -contains $_.userId }
 
+    # Format filtered logs for output
     $entries = $filtered | ForEach-Object {
         [PSCustomObject]@{
             UserId      = $_.userId
@@ -70,6 +87,7 @@ do {
         }
     }
 
+    # Append entries to output file
     if ($entries.Count -gt 0) {
         $entries | Export-Csv -Path $OutputFile -Append -NoTypeInformation -Encoding UTF8
         Write-Host "✅ Processed and saved $($entries.Count) log(s)..."
@@ -80,5 +98,5 @@ do {
 
 Write-Host "`n✅ Finished exporting filtered sign-in logs to: $OutputFile" -ForegroundColor Green
 
-# Cleanup
+# Disconnect from Microsoft Graph
 Disconnect-MgGraph
